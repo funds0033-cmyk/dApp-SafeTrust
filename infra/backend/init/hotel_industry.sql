@@ -404,3 +404,70 @@ CREATE TRIGGER update_hotel_pricing_rules_updated_at
 -- Add helpful comment
 COMMENT ON TABLE hotel_industry.pricing_rules IS 
 'Pricing rules for Hotel Industry tenant - supports room deposits, booking fees, seasonal rates, and hospitality-specific pricing models';
+
+-- ── Migration: 1757000000001_rooms_images_and_reservation_guards
+
+-- 1. Add is_available column (manual on/off switch, replaces status boolean)
+ALTER TABLE rooms
+  ADD COLUMN IF NOT EXISTS is_available BOOLEAN NOT NULL DEFAULT true;
+
+UPDATE rooms SET is_available = COALESCE(status, true);
+
+-- 2. Add image_urls array (up to 5 HTTPS URLs)
+ALTER TABLE rooms
+  ADD COLUMN IF NOT EXISTS image_urls TEXT[] DEFAULT '{}';
+
+-- 3. btree_gist extension required by the exclusion constraint on daterange
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+
+-- 4. Check constraint: check_out must be strictly after check_in
+ALTER TABLE reservations
+  ADD CONSTRAINT IF NOT EXISTS reservations_valid_dates
+    CHECK (check_out > check_in);
+
+-- 5. Exclusion constraint: no two non-cancelled reservations may overlap
+--    for the same room. Back-to-back stays ([day1,day2) and [day2,day3)) are fine.
+ALTER TABLE reservations
+  ADD CONSTRAINT IF NOT EXISTS reservations_no_overlap
+    EXCLUDE USING gist (
+      room_id WITH =,
+      daterange(check_in::date, check_out::date, '[)') WITH &&
+    )
+    WHERE (reservation_status <> 'cancelled');
+
+-- Supporting index for fast overlap look-ups
+CREATE INDEX IF NOT EXISTS idx_reservations_room_dates
+  ON reservations (room_id, check_in, check_out)
+  WHERE reservation_status <> 'cancelled';
+
+-- 6. available_rooms() — returns rooms that are available for a date range
+CREATE OR REPLACE FUNCTION available_rooms(
+  p_hotel_id   UUID,
+  p_check_in   DATE,
+  p_check_out  DATE
+)
+RETURNS SETOF rooms
+LANGUAGE sql STABLE AS $$
+  SELECT r.*
+  FROM   rooms r
+  WHERE  r.hotel_id     = p_hotel_id
+    AND  r.is_available = true
+    AND  NOT EXISTS (
+           SELECT 1
+           FROM   reservations x
+           WHERE  x.room_id = r.room_id
+             AND  x.reservation_status <> 'cancelled'
+             AND  daterange(x.check_in::date, x.check_out::date, '[)')
+                  &&
+                  daterange(p_check_in, p_check_out, '[)')
+         );
+$$;
+
+-- ── Migration: 1757000000002_seed_room_types
+
+INSERT INTO room_types (name, description)
+VALUES
+  ('Single', 'A room with a single bed, suitable for one guest.'),
+  ('Double', 'A room with a double or twin beds, suitable for two guests.'),
+  ('Suite',  'A premium suite with a separate living area and enhanced amenities.')
+ON CONFLICT (name) DO NOTHING;

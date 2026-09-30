@@ -16,6 +16,42 @@ object_relationships:
           schema: public
         columns:
           - room_id
+insert_permissions:
+  - role: landlord
+    permission:
+      check:
+        hotel_id:
+          _in: X-Hasura-Hotel-Ids
+      columns:
+        - hotel_id
+        - room_number
+        - room_type_id
+        - price_night
+        - capacity
+        - is_available
+        - image_urls
+update_permissions:
+  - role: landlord
+    permission:
+      filter:
+        hotel_id:
+          _in: X-Hasura-Hotel-Ids
+      columns:
+        - room_number
+        - room_type_id
+        - price_night
+        - capacity
+        - is_available
+        - image_urls
+      check:
+        hotel_id:
+          _in: X-Hasura-Hotel-Ids
+delete_permissions:
+  - role: landlord
+    permission:
+      filter:
+        hotel_id:
+          _in: X-Hasura-Hotel-Ids
 select_permissions:
   - role: tenant
     permission:
@@ -27,6 +63,8 @@ select_permissions:
         - price_night
         - capacity
         - status
+        - is_available
+        - image_urls
         - created_at
         - updated_at
       filter: {}
@@ -40,6 +78,8 @@ select_permissions:
         - price_night
         - capacity
         - status
+        - is_available
+        - image_urls
         - created_at
         - updated_at
       filter: {}
