@@ -1,7 +1,8 @@
 import type { Request, Response } from 'express';
-import { trustlessWorkRequest, TrustlessWorkRequestError, getErrorMessages } from '../../services/trustlesswork.js';
+import { trustlessWorkRequest } from '../../services/trustlesswork.js';
 import { guardEscrowAction, sendConflict } from './transition-guard.js';
 import { asyncHandler } from '../../http/async-handler.js';
+import { ApiError } from '../../http/api-error.js';
 
 type FundRequestBody = {
   contractId?: string;
@@ -24,65 +25,39 @@ type FundResponse = {
 };
 
 export const fundEscrowHandler = asyncHandler(async (
-  req: Request<{}, FundResponse | { error: string }, FundRequestBody>,
-  res: Response<FundResponse | { error: string }>,
+  req: Request<{}, FundResponse, FundRequestBody>,
+  res: Response<FundResponse>,
 ) => {
   const { contractId, signer, amount, engagementId } = req.body || {};
 
   if (!contractId || !signer || typeof amount !== 'number' || !engagementId) {
-    return res.status(400).json({
-      error: 'Missing required fields: contractId, signer, amount, engagementId.',
-    });
+    throw new ApiError(400, 'MISSING_FIELDS', 'Missing required fields: contractId, signer, amount, engagementId.');
   }
 
   if (amount <= 0 || !Number.isFinite(amount)) {
-    return res.status(400).json({
-      error: 'Invalid amount: must be a positive number.',
-    });
+    throw new ApiError(400, 'INVALID_AMOUNT', 'Invalid amount: must be a positive number.');
   }
 
-  try {
-    const conflict = await guardEscrowAction(res, 'fund', contractId);
-    if (conflict) return conflict;
+  const conflict = await guardEscrowAction(res, 'fund', contractId);
+  if (conflict) return conflict;
 
-    const result = await trustlessWorkRequest<FundEscrowTWResponse>(
-      '/escrow/single-release/fund-escrow',
-      {
-        method: 'POST',
-        body: { contractId, signer, amount },
-      },
-    );
+  const result = await trustlessWorkRequest<FundEscrowTWResponse>(
+    '/escrow/single-release/fund-escrow',
+    {
+      method: 'POST',
+      body: { contractId, signer, amount },
+    },
+  );
 
-    const unsignedXdr = result.unsignedXdr ?? result.unsignedTransaction;
-    if (!unsignedXdr) {
-      return res.status(502).json({
-        error: 'TrustlessWork fund request returned no unsigned transaction.',
-        payload: result,
-      });
-    }
-
-    return res.status(200).json({
-      unsignedXdr,
-      txHash: result.txHash ?? '',
-      contractId,
-      engagementId,
-    });
-  } catch (error) {
-    const conflict = sendConflict(res, error);
-    if (conflict) return conflict;
-
-    if (error instanceof TrustlessWorkRequestError) {
-      return res.status(error.statusCode).json({
-        error: error.message,
-        messages: error.messages,
-        payload: error.payload,
-      });
-    }
-
-    const messages = getErrorMessages(error, 'Failed to build fund transaction.');
-    return res.status(500).json({
-      error: messages[0],
-      messages,
-    });
+  const unsignedXdr = result.unsignedXdr ?? result.unsignedTransaction;
+  if (!unsignedXdr) {
+    throw new ApiError(502, 'TRUSTLESS_WORK_EMPTY_RESPONSE', 'TrustlessWork fund request returned no unsigned transaction.', { retryable: true });
   }
+
+  return res.status(200).json({
+    unsignedXdr,
+    txHash: result.txHash ?? '',
+    contractId,
+    engagementId,
+  });
 });

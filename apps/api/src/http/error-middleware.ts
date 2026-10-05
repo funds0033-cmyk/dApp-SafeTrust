@@ -8,8 +8,8 @@ export const errorHandler: ErrorRequestHandler = (err, req, res, next) => {
   const requestId: string = res.locals.requestId ?? req.get('X-Request-ID') ?? randomUUID();
   const apiError = err instanceof ApiError ? err : new ApiError(500, 'INTERNAL_SERVER_ERROR', 'Unexpected server error', { cause: err, requestId });
 
-  // Log the full error server-side
-  console.error(`[${requestId}] ${apiError.status} ${apiError.code}: ${apiError.detail}`, apiError.cause);
+  // Log the full error server-side (without exposing cause to avoid leaking sensitive data)
+  console.error(`[${requestId}] ${apiError.status} ${apiError.code}: ${apiError.detail}`);
 
   // Send standardized response
   res.set('Content-Type', 'application/problem+json');

@@ -65,24 +65,22 @@ type RecoverResponse = {
 };
 
 export const recoverFromTxhashHandler = asyncHandler(async (
-  req: Request<{}, RecoverResponse | { error: string }, RecoverRequestBody>,
-  res: Response<RecoverResponse | { error: string }>,
+  req: Request<{}, RecoverResponse, RecoverRequestBody>,
+  res: Response<RecoverResponse>,
 ) => {
   const { txHash, action, contractId } = req.body || {};
 
   if (!txHash) {
-    return res.status(400).json({ error: 'Missing required field: txHash' });
+    throw new ApiError(400, 'MISSING_TX_HASH', 'Missing required field: txHash');
   }
   if (!action) {
-    return res.status(400).json({ error: 'Missing required field: action' });
+    throw new ApiError(400, 'MISSING_ACTION', 'Missing required field: action');
   }
   if (!VALID_ACTIONS.includes(action)) {
-    return res.status(400).json({
-      error: `Invalid action. Must be one of: ${VALID_ACTIONS.join(', ')}`,
-    });
+    throw new ApiError(400, 'INVALID_ACTION', `Invalid action. Must be one of: ${VALID_ACTIONS.join(', ')}`);
   }
   if (!contractId) {
-    return res.status(400).json({ error: 'Missing required field: contractId' });
+    throw new ApiError(400, 'MISSING_CONTRACT_ID', 'Missing required field: contractId');
   }
 
   const missing = REQUIRED_FIELDS[action].filter((field) => {
@@ -92,9 +90,7 @@ export const recoverFromTxhashHandler = asyncHandler(async (
     return typeof value !== 'string' || value.trim().length === 0;
   });
   if (missing.length > 0) {
-    return res.status(400).json({
-      error: `${action} action requires: contractId, ${missing.join(', ')}`,
-    });
+    throw new ApiError(400, 'MISSING_ACTION_FIELDS', `${action} action requires: contractId, ${missing.join(', ')}`);
   }
 
   // Verify the transaction exists on-chain via TW indexer — throws TrustlessWorkRequestError
@@ -108,9 +104,7 @@ export const recoverFromTxhashHandler = asyncHandler(async (
   const result = await updateEscrowStatusByContractId(contractId, status);
 
   if (result.update_escrows.affected_rows === 0) {
-    return res.status(404).json({
-      error: `No escrow record found for contractId: ${contractId}`,
-    });
+    throw new ApiError(404, 'ESCROW_NOT_FOUND', `No escrow record found for contractId: ${contractId}`);
   }
 
   return res.status(200).json({ recovered: true, action, contractId, txHash, status });

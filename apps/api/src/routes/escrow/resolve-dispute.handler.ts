@@ -17,10 +17,10 @@ export const resolveDisputeHandler = asyncHandler(async (
   const { contractId, engagementId, disputeResolver, distributions } = req.body ?? {};
 
   if (!contractId || !engagementId || !disputeResolver || !Array.isArray(distributions) || distributions.length === 0) {
-    return res.status(400).json({ error: 'Missing required fields: contractId, engagementId, disputeResolver, distributions.' });
+    throw new ApiError(400, 'MISSING_FIELDS', 'Missing required fields: contractId, engagementId, disputeResolver, distributions.');
   }
   if (distributions.some(({ address, amount }) => !address || !Number.isFinite(amount) || amount <= 0)) {
-    return res.status(400).json({ error: 'Every distribution needs a recipient address and a positive amount.' });
+    throw new ApiError(400, 'INVALID_DISTRIBUTION', 'Every distribution needs a recipient address and a positive amount.');
   }
 
   const result = await trustlessWorkRequest<{ unsignedXdr?: string; unsignedTransaction?: string; txHash?: string }>(

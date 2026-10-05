@@ -22,16 +22,13 @@ type DeployResponse = {
 };
 
 export const deployEscrowHandler = asyncHandler(async (
-  req: Request<Record<string, never>, DeployResponse | { error: string }, DeployRequestBody>,
-  res: Response<DeployResponse | { error: string }>,
+  req: Request<Record<string, never>, DeployResponse, DeployRequestBody>,
+  res: Response<DeployResponse>,
 ) => {
   const { apartmentId, senderAddress, receiverAddress, amount, engagementId } = req.body;
 
   if (!apartmentId || !senderAddress || !receiverAddress || !Number.isFinite(amount) || amount <= 0) {
-    res.status(400).json({
-      error: 'Missing required fields: apartmentId, senderAddress, receiverAddress, amount',
-    });
-    return;
+    throw new ApiError(400, 'MISSING_FIELDS', 'Missing required fields: apartmentId, senderAddress, receiverAddress, amount');
   }
 
   const resolvedEngagementId = engagementId ?? `engagement-${apartmentId}`;
@@ -44,14 +41,13 @@ export const deployEscrowHandler = asyncHandler(async (
       `[escrow/deploy] idempotent hit — engagementId: ${resolvedEngagementId}, ` +
       `contractId: ${idempotencyResult.result.contract_id}`,
     );
-    res.status(200).json({
+    return res.status(200).json({
       status: 'CACHED',
       engagementId: resolvedEngagementId,
       contractId: idempotencyResult.result.contract_id ?? undefined,
       unsignedXDR: '',
       cached: true,
     });
-    return;
   }
   // ── End idempotency check ──────────────────────────────────────────────
 
@@ -129,7 +125,7 @@ export const deployEscrowHandler = asyncHandler(async (
     },
   );
 
-  res.status(200).json({
+  return res.status(200).json({
     status: twData.status,
     contractId: twData.contractId,
     unsignedXDR: twData.unsignedTransaction ?? '',

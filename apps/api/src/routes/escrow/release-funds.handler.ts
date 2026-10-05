@@ -1,7 +1,8 @@
 import type { Request, Response } from 'express';
-import { trustlessWorkRequest, TrustlessWorkRequestError, getErrorMessages } from '../../services/trustlesswork.js';
+import { trustlessWorkRequest } from '../../services/trustlesswork.js';
 import { guardEscrowAction, sendConflict } from './transition-guard.js';
 import { asyncHandler } from '../../http/async-handler.js';
+import { ApiError } from '../../http/api-error.js';
 
 type ReleaseRequestBody = {
   contractId?: string;
@@ -28,64 +29,40 @@ type ReleaseResponse = {
 };
 
 export const releaseFundsHandler = asyncHandler(async (
-  req: Request<{}, ReleaseResponse | { error: string }, ReleaseRequestBody>,
-  res: Response<ReleaseResponse | { error: string }>,
+  req: Request<{}, ReleaseResponse, ReleaseRequestBody>,
+  res: Response<ReleaseResponse>,
 ) => {
   const { contractId, releaseSigner, engagementId } = req.body || {};
 
   if (!contractId || !releaseSigner) {
-    return res.status(400).json({
-      error: 'Missing required fields: contractId, releaseSigner.',
-    });
+    throw new ApiError(400, 'MISSING_FIELDS', 'Missing required fields: contractId, releaseSigner.');
   }
 
-  try {
-    const conflict = await guardEscrowAction(res, 'release_funds', contractId);
-    if (conflict) return conflict;
+  const conflict = await guardEscrowAction(res, 'release_funds', contractId);
+  if (conflict) return conflict;
 
-    const result = await trustlessWorkRequest<ReleaseFundsTWResponse>(
-      '/escrow/single-release/release-funds',
-      {
-        method: 'POST',
-        body: { contractId, releaseSigner },
-      },
-    );
+  const result = await trustlessWorkRequest<ReleaseFundsTWResponse>(
+    '/escrow/single-release/release-funds',
+    {
+      method: 'POST',
+      body: { contractId, releaseSigner },
+    },
+  );
 
-    // Note: unsignedXdr is the canonical key; unsignedXDR is kept for legacy frontend consumers
-    // and will be removed once all callers migrate to unsignedXdr.
-    const unsignedXdr = result.unsignedXdr ?? result.unsignedTransaction;
+  // Note: unsignedXdr is the canonical key; unsignedXDR is kept for legacy frontend consumers
+  // and will be removed once all callers migrate to unsignedXdr.
+  const unsignedXdr = result.unsignedXdr ?? result.unsignedTransaction;
 
-    if (!unsignedXdr || result.status === 'FAILED') {
-      return res.status(502).json({
-        error: result.message ?? 'TrustlessWork release-funds returned no unsigned transaction.',
-        payload: result,
-      });
-    }
-
-    return res.status(200).json({
-      unsignedXdr,
-      unsignedXDR: unsignedXdr,
-      txHash: result.txHash ?? '',
-      contractId,
-      engagementId: engagementId ?? '',
-      status: 'completed',
-    });
-  } catch (error) {
-    const conflict = sendConflict(res, error);
-    if (conflict) return conflict;
-
-    if (error instanceof TrustlessWorkRequestError) {
-      return res.status(error.statusCode).json({
-        error: error.message,
-        messages: error.messages,
-        payload: error.payload,
-      });
-    }
-
-    const messages = getErrorMessages(error, 'Failed to build release transaction.');
-    return res.status(500).json({
-      error: messages[0],
-      messages,
-    });
+  if (!unsignedXdr || result.status === 'FAILED') {
+    throw new ApiError(502, 'TRUSTLESS_WORK_EMPTY_RESPONSE', result.message ?? 'TrustlessWork release-funds returned no unsigned transaction.', { retryable: true });
   }
+
+  return res.status(200).json({
+    unsignedXdr,
+    unsignedXDR: unsignedXdr,
+    txHash: result.txHash ?? '',
+    contractId,
+    engagementId: engagementId ?? '',
+    status: 'completed',
+  });
 });

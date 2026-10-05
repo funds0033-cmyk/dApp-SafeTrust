@@ -1,11 +1,9 @@
-import { Request, Response } from 'express';
+import type { Request, Response } from 'express';
 import { TransactionBuilder, Networks } from '@stellar/stellar-sdk';
 import { getPendingActionByHash, markPendingActionSubmitted } from '../../services/pending-actions.js';
 import {
   trustlessWorkRequest,
   extractTransactionHash,
-  TrustlessWorkRequestError,
-  getErrorMessages,
 } from '../../services/trustlesswork.js';
 import {
   dbInitializeEscrow,
@@ -33,6 +31,8 @@ import {
   InvalidTransitionError,
   type EscrowActionName,
 } from '../../domain/escrow-state.js';
+import { asyncHandler } from '../../http/async-handler.js';
+import { ApiError } from '../../http/api-error.js';
 
 type EscrowAction =
   | 'initialize'
@@ -93,286 +93,239 @@ const REQUIRED_FIELDS: Record<EscrowAction, (keyof SendTransactionBody)[]> = {
 const isNonEmptyString = (value: unknown): value is string =>
   typeof value === 'string' && value.trim().length > 0;
 
-export const sendTransactionHandler = async (
-  req: Request<{}, Record<string, unknown> | { error: string; messages?: string[]; payload?: unknown }, SendTransactionBody>,
-  res: Response<Record<string, unknown> | { error: string; messages?: string[]; payload?: unknown }>
-): Promise<Response> => {
-  try {
-    const body = req.body || {};
-    const {
-      signedXdr,
-      action,
-      contractId,
-      engagementId,
-      propertyId,
-      apartmentId,
-      senderAddress,
-      receiverAddress,
-      releaser,
-      amount,
-      milestoneId,
-      approver,
-      releaseSigner,
-      status,
-    } = body;
+export const sendTransactionHandler = asyncHandler(async (
+  req: Request<{}, Record<string, unknown>, SendTransactionBody>,
+  res: Response<Record<string, unknown>>,
+) => {
+  const body = req.body || {};
+  const {
+    signedXdr,
+    action,
+    contractId,
+    engagementId,
+    propertyId,
+    apartmentId,
+    senderAddress,
+    receiverAddress,
+    releaser,
+    amount,
+    milestoneId,
+    approver,
+    releaseSigner,
+    status,
+  } = body;
 
-    if (!signedXdr || typeof signedXdr !== 'string') {
-      return res.status(400).json({ error: 'Missing or invalid signedXdr' });
+  if (!signedXdr || typeof signedXdr !== 'string') {
+    throw new ApiError(400, 'INVALID_XDR', 'Missing or invalid signedXdr');
+  }
+
+  // ── Action-based transition-guarded flow ──────────────────────────────────
+  if (action) {
+    if (!VALID_ACTIONS.includes(action)) {
+      throw new ApiError(400, 'INVALID_ACTION', `Invalid action. Must be one of: ${VALID_ACTIONS.join(', ')}`);
     }
 
-    // ── Action-based transition-guarded flow ──────────────────────────────────
-    if (action) {
-      if (!VALID_ACTIONS.includes(action)) {
-        return res.status(400).json({
-          error: `Invalid action. Must be one of: ${VALID_ACTIONS.join(', ')}`,
+    if (!isNonEmptyString(contractId)) {
+      throw new ApiError(400, 'MISSING_CONTRACT_ID', 'Missing required fields: contractId');
+    }
+
+    const propId = propertyId || apartmentId;
+    const missing = REQUIRED_FIELDS[action].filter((field) => {
+      const value = body[field];
+      if (field === 'engagementId' && engagementId) return false;
+      return value == null || (field !== 'amount' && !isNonEmptyString(value));
+    });
+
+    if (action === 'initialize' && !propId) {
+      missing.push('propertyId');
+    }
+
+    if (missing.length > 0) {
+      throw new ApiError(400, 'MISSING_ACTION_FIELDS', `${action} action requires: contractId, ${missing.join(', ')}`);
+    }
+
+    if (action === 'initialize' || action === 'fund') {
+      if (typeof amount !== 'number' || !Number.isFinite(amount) || amount <= 0) {
+        throw new ApiError(400, 'INVALID_AMOUNT', 'Invalid amount: must be a positive number.');
+      }
+    }
+
+    // Pre-validate transition before Trustless Work call
+    const conflict = await guardEscrowAction(res, action as EscrowActionName, contractId);
+    if (conflict) return conflict;
+
+    const result = await trustlessWorkRequest<SendTransactionTWResponse & Record<string, unknown>>(
+      '/helper/send-transaction',
+      {
+        method: 'POST',
+        body: { signedXdr },
+      },
+    );
+
+    if (result.status !== 'SUCCESS') {
+      throw new ApiError(502, 'TRUSTLESS_WORK_FAILED', 'TrustlessWork send-transaction failed.', { retryable: true });
+    }
+
+    const txHash = extractTransactionHash(result);
+    if (txHash) {
+      const ledgerConfirmation = await confirmTransactionWithRetry(txHash, { maxAttempts: 5, intervalMs: 2000 });
+
+      if (ledgerConfirmation === 'failed') {
+        return res.status(202).json({
+          status: 'confirming',
+          message: 'Stellar rejected the submitted transaction, so no escrow status change was applied.',
+          contractId,
+          transactionHash: txHash,
+          ledgerStatus: 'failed',
         });
       }
 
-      if (!isNonEmptyString(contractId)) {
-        return res.status(400).json({
-          error: 'Missing required fields: contractId',
+      if (ledgerConfirmation !== 'success') {
+        return res.status(202).json({
+          status: 'confirming',
+          message: 'Transaction accepted by Trustless Work; waiting for Stellar confirmation.',
+          contractId,
+          transactionHash: txHash,
+          ledgerStatus: 'unknown',
         });
       }
+    }
 
-      const propId = propertyId || apartmentId;
-      const missing = REQUIRED_FIELDS[action].filter((field) => {
-        const value = body[field];
-        if (field === 'engagementId' && engagementId) return false;
-        return value == null || (field !== 'amount' && !isNonEmptyString(value));
-      });
+    const resolvedContractId = (result.contractId as string | undefined) ?? contractId;
+    let insertedId: string | undefined;
 
-      if (action === 'initialize' && !propId) {
-        missing.push('propertyId');
-      }
-
-      if (missing.length > 0) {
-        return res.status(400).json({
-          error: `${action} action requires: contractId, ${missing.join(', ')}`,
-        });
-      }
-
-      if (action === 'initialize' || action === 'fund') {
-        if (typeof amount !== 'number' || !Number.isFinite(amount) || amount <= 0) {
-          return res.status(400).json({
-            error: 'Invalid amount: must be a positive number.',
+    try {
+      switch (action) {
+        case 'initialize': {
+          const effectiveReleaser = releaser || process.env.PLATFORM_STELLAR_ADDRESS || senderAddress!;
+          await dbInitializeEscrow({
+            contractId: resolvedContractId,
+            engagementId: engagementId!,
+            apartmentId: propId!,
+            senderAddress: senderAddress!,
+            receiverAddress: receiverAddress!,
+            releaser: effectiveReleaser,
+            amount: amount!,
           });
-        }
-      }
-
-      // Pre-validate transition before Trustless Work call
-      const conflict = await guardEscrowAction(res, action as EscrowActionName, contractId);
-      if (conflict) return conflict;
-
-      let result: SendTransactionTWResponse & Record<string, unknown>;
-      try {
-        result = await trustlessWorkRequest<SendTransactionTWResponse & Record<string, unknown>>(
-          '/helper/send-transaction',
-          {
-            method: 'POST',
-            body: { signedXdr },
-          },
-        );
-      } catch (error) {
-        const transitionConflict = sendConflict(res, error);
-        if (transitionConflict) return transitionConflict;
-
-        if (error instanceof TrustlessWorkRequestError) {
-          return res.status(error.statusCode).json({
-            error: error.message,
-            messages: error.messages,
-            payload: error.payload,
-          });
-        }
-        const messages = getErrorMessages(error, 'Failed to submit signed transaction.');
-        return res.status(502).json({ error: messages[0], messages });
-      }
-
-      if (result.status !== 'SUCCESS') {
-        const messages = getErrorMessages(result, 'TrustlessWork send-transaction failed.');
-        return res.status(502).json({ error: messages[0], messages, payload: result });
-      }
-
-      const txHash = extractTransactionHash(result);
-      if (txHash) {
-        const ledgerConfirmation = await confirmTransactionWithRetry(txHash, { maxAttempts: 5, intervalMs: 2000 });
-
-        if (ledgerConfirmation === 'failed') {
-          return res.status(202).json({
-            status: 'confirming',
-            message: 'Stellar rejected the submitted transaction, so no escrow status change was applied.',
-            contractId,
-            transactionHash: txHash,
-            ledgerStatus: 'failed',
-          });
-        }
-
-        if (ledgerConfirmation !== 'success') {
-          return res.status(202).json({
-            status: 'confirming',
-            message: 'Transaction accepted by Trustless Work; waiting for Stellar confirmation.',
-            contractId,
-            transactionHash: txHash,
-            ledgerStatus: 'unknown',
-          });
-        }
-      }
-
-      const resolvedContractId = (result.contractId as string | undefined) ?? contractId;
-      let insertedId: string | undefined;
-
-      try {
-        switch (action) {
-          case 'initialize': {
-            const effectiveReleaser = releaser || process.env.PLATFORM_STELLAR_ADDRESS || senderAddress!;
-            await dbInitializeEscrow({
+          const existing = await hasuraRequest<{ escrows: { id: string }[] }>(
+            `query FindEscrowByContractId($contractId: String!) {
+              escrows(where: { contract_id: { _eq: $contractId } }) { id }
+            }`,
+            { contractId: resolvedContractId },
+          );
+          if (existing.escrows.length > 0) {
+            insertedId = existing.escrows[0].id;
+          } else {
+            const record = await insertEscrowRecord({
               contractId: resolvedContractId,
               engagementId: engagementId!,
-              apartmentId: propId!,
+              propertyId: propId!,
               senderAddress: senderAddress!,
               receiverAddress: receiverAddress!,
-              releaser: effectiveReleaser,
               amount: amount!,
+              status: 'created',
             });
-            const existing = await hasuraRequest<{ escrows: { id: string }[] }>(
-              `query FindEscrowByContractId($contractId: String!) {
-                escrows(where: { contract_id: { _eq: $contractId } }) { id }
-              }`,
-              { contractId: resolvedContractId },
-            );
-            if (existing.escrows.length > 0) {
-              insertedId = existing.escrows[0].id;
-            } else {
-              const record = await insertEscrowRecord({
-                contractId: resolvedContractId,
-                engagementId: engagementId!,
-                propertyId: propId!,
-                senderAddress: senderAddress!,
-                receiverAddress: receiverAddress!,
-                amount: amount!,
-                status: 'created',
-              });
-              insertedId = record.insert_escrows_one.id;
-            }
-            break;
+            insertedId = record.insert_escrows_one.id;
           }
-          case 'fund': {
-            const hash = extractTransactionHash(result) ?? undefined;
-            await dbFundEscrow(resolvedContractId, amount!, engagementId, hash);
-            break;
-          }
-          case 'mark_milestone_completed': {
-            const hash = extractTransactionHash(result) ?? undefined;
-            await dbMarkMilestoneCompleted(resolvedContractId, milestoneId!, engagementId, hash);
-            break;
-          }
-          case 'approve_milestone': {
-            const hash = extractTransactionHash(result) ?? undefined;
-            await dbApproveMilestone(resolvedContractId, milestoneId!, approver!, engagementId, hash);
-            break;
-          }
-          case 'release_funds': {
-            const hash = extractTransactionHash(result) ?? undefined;
-            await dbReleaseFunds(resolvedContractId, releaseSigner!, engagementId, hash);
-            break;
-          }
-          case 'dispute': {
-            const hash = extractTransactionHash(result) ?? undefined;
-            await dbDisputeEscrow(resolvedContractId, engagementId, hash);
-            break;
-          }
-          case 'resolve_dispute': {
-            const hash = extractTransactionHash(result) ?? undefined;
-            await dbResolveDispute(resolvedContractId, engagementId, hash);
-            break;
-          }
+          break;
         }
-      } catch (error) {
-        if (error instanceof ConcurrentTransitionError) {
-          return res.status(409).json({
-            error: 'Escrow changed. Refresh and retry',
-            from: error.from,
-            to: error.to,
-          });
+        case 'fund': {
+          const hash = extractTransactionHash(result) ?? undefined;
+          await dbFundEscrow(resolvedContractId, amount!, engagementId, hash);
+          break;
         }
-
-        if (isUniqueViolation(error) || isEscrowChangedError(error)) {
-          return res.status(409).json({
-            error: 'Escrow changed. Refresh and retry',
-          });
+        case 'mark_milestone_completed': {
+          const hash = extractTransactionHash(result) ?? undefined;
+          await dbMarkMilestoneCompleted(resolvedContractId, milestoneId!, engagementId, hash);
+          break;
         }
-
-        const conflict = sendConflict(res, error);
-        if (conflict) return conflict;
-
-        const message = getErrorMessages(error, 'Database synchronization failed.');
-        return res.status(500).json({
-          error: 'Transaction confirmed on-chain, but database synchronization failed.',
-          transactionHash: extractTransactionHash(result),
-          contractId: resolvedContractId,
-          detail: message[0],
+        case 'approve_milestone': {
+          const hash = extractTransactionHash(result) ?? undefined;
+          await dbApproveMilestone(resolvedContractId, milestoneId!, approver!, engagementId, hash);
+          break;
+        }
+        case 'release_funds': {
+          const hash = extractTransactionHash(result) ?? undefined;
+          await dbReleaseFunds(resolvedContractId, releaseSigner!, engagementId, hash);
+          break;
+        }
+        case 'dispute': {
+          const hash = extractTransactionHash(result) ?? undefined;
+          await dbDisputeEscrow(resolvedContractId, engagementId, hash);
+          break;
+        }
+        case 'resolve_dispute': {
+          const hash = extractTransactionHash(result) ?? undefined;
+          await dbResolveDispute(resolvedContractId, engagementId, hash);
+          break;
+        }
+      }
+    } catch (error) {
+      if (error instanceof ConcurrentTransitionError) {
+        return res.status(409).json({
+          error: 'Escrow changed. Refresh and retry',
+          from: error.from,
+          to: error.to,
         });
       }
 
-      const responsePayload: Record<string, unknown> = {
-        status: result.status,
-        message: result.message,
-        contractId: resolvedContractId,
-        transactionHash: extractTransactionHash(result),
-        engagementId,
-      };
-
-      if (action === 'initialize') {
-        responsePayload.escrowId = insertedId;
+      if (isUniqueViolation(error) || isEscrowChangedError(error)) {
+        return res.status(409).json({
+          error: 'Escrow changed. Refresh and retry',
+        });
       }
 
-      return res.status(200).json(responsePayload);
+      const conflict = sendConflict(res, error);
+      if (conflict) return conflict;
+
+      throw new ApiError(500, 'DB_SYNC_FAILED', 'Transaction confirmed on-chain, but database synchronization failed.', { retryable: true });
     }
 
-    // ── Pending-action hash binding flow (PR #459) ───────────────────────────
-    const networkPassphrase = process.env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET;
-    const tx = TransactionBuilder.fromXDR(signedXdr, networkPassphrase);
-    const txHash = tx.hash().toString('hex');
+    const responsePayload: Record<string, unknown> = {
+      status: result.status,
+      message: result.message,
+      contractId: resolvedContractId,
+      transactionHash: extractTransactionHash(result),
+      engagementId,
+    };
 
-    const pending = await getPendingActionByHash(txHash);
-
-    if (!pending) {
-      return res.status(404).json({ error: 'Unknown transaction. Build it through SafeTrust first.' });
+    if (action === 'initialize') {
+      responsePayload.escrowId = insertedId;
     }
 
-    // @ts-ignore
-    if (pending.built_for_uid !== req.user?.uid) {
-      return res.status(403).json({ error: 'This transaction was built for another user.' });
-    }
-
-    if (pending.status === "submitted" || pending.status === "confirmed") {
-      return res.status(200).json({ txHash, status: pending.status }); // idempotent replay
-    }
-
-    if (new Date(pending.expires_at) < new Date()) {
-      return res.status(410).json({ error: 'Transaction expired. Build it again.' });
-    }
-
-    const twResult = await trustlessWorkRequest('/helper/send-transaction', {
-      method: 'POST',
-      body: { signedXdr },
-    });
-
-    await markPendingActionSubmitted(pending.id);
-
-    return res.status(200).json({ txHash, status: 'submitted', twResult });
-  } catch (error) {
-    if (error instanceof TrustlessWorkRequestError) {
-      return res.status(error.statusCode).json({
-        error: error.message,
-        messages: error.messages,
-        payload: error.payload,
-      });
-    }
-
-    const messages = getErrorMessages(error, 'Failed to send transaction.');
-    return res.status(500).json({
-      error: messages[0],
-      messages,
-    });
+    return res.status(200).json(responsePayload);
   }
-};
+
+  // ── Pending-action hash binding flow (PR #459) ───────────────────────────
+  const networkPassphrase = process.env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET;
+  const tx = TransactionBuilder.fromXDR(signedXdr, networkPassphrase);
+  const txHash = tx.hash().toString('hex');
+
+  const pending = await getPendingActionByHash(txHash);
+
+  if (!pending) {
+    throw new ApiError(404, 'UNKNOWN_TRANSACTION', 'Unknown transaction. Build it through SafeTrust first.');
+  }
+
+  // @ts-ignore
+  if (pending.built_for_uid !== req.user?.uid) {
+    throw new ApiError(403, 'FORBIDDEN_TRANSACTION', 'This transaction was built for another user.');
+  }
+
+  if (pending.status === "submitted" || pending.status === "confirmed") {
+    return res.status(200).json({ txHash, status: pending.status }); // idempotent replay
+  }
+
+  if (new Date(pending.expires_at) < new Date()) {
+    throw new ApiError(410, 'TRANSACTION_EXPIRED', 'Transaction expired. Build it again.');
+  }
+
+  const twResult = await trustlessWorkRequest('/helper/send-transaction', {
+    method: 'POST',
+    body: { signedXdr },
+  });
+
+  await markPendingActionSubmitted(pending.id);
+
+  return res.status(200).json({ txHash, status: 'submitted', twResult });
+});
